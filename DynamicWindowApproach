@@ -1,0 +1,341 @@
+"""
+
+Mobile robot motion planning sample with Dynamic Window Approach
+author: Tong Guo
+edited from Atsushi Sakai (@Atsushi_twi), Göktuğ Karakaşlı
+
+"""
+
+import math
+from enum import Enum
+import imageio
+import os
+import os.path
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+show_animation = True
+
+
+def dwa_control(x, config, goal, ob):
+    """
+    Dynamic Window Approach control
+    """
+
+    dw = calc_dynamic_window(x, config)
+
+    u, trajectory = calc_final_input(x, dw, config, goal, ob)
+
+    return u, trajectory
+ # 输出一个被选择的轨迹
+
+class RobotType(Enum):
+    circle = 0
+    rectangle = 1
+
+
+class Config:
+    """
+    simulation parameter class
+    """
+
+    def __init__(self):
+        # robot parameter
+        self.max_speed = 1.0  # [m/s]
+        self.min_speed = -0.5  # [m/s]
+        self.max_yawrate = 40.0 * math.pi / 180.0  # [rad/s]
+        self.max_accel = 0.2  # [m/ss]
+        self.max_dyawrate = 40.0 * math.pi / 180.0  # [rad/ss]
+        self.v_reso = 0.01  # [m/s]
+        self.yawrate_reso = 0.1 * math.pi / 180.0  # [rad/s]
+        self.dt = 0.1  # [s] Time tick for motion prediction
+        self.predict_time = 3.0  # [s]
+        self.to_goal_cost_gain = 0.15
+        self.speed_cost_gain = 1.0
+        self.obstacle_cost_gain = 1.0
+        self.robot_type = RobotType.circle
+
+        # if robot_type == RobotType.circle
+        # Also used to check if goal is reached in both types
+        self.robot_radius = 1.0  # [m] for collision check
+
+        # if robot_type == RobotType.rectangle
+        self.robot_width = 0.5  # [m] for collision check
+        self.robot_length = 1.2  # [m] for collision check
+
+    @property
+    def robot_type(self):
+        return self._robot_type
+
+    @robot_type.setter
+    def robot_type(self, value):
+        if not isinstance(value, RobotType):
+            raise TypeError("robot_type must be an instance of RobotType")
+        self._robot_type = value
+
+
+def motion(x, u, dt):
+    """
+    motion model
+     #原始状态  x = [x, y, orientation, v, w]
+      u = [v, w]
+    具体的机器人运动方式是：改变在坐标系中的位置(x,y)；改变当前前进的指向角；
+    """
+
+    x[2] += u[1] * dt  #oritentation
+    x[0] += u[0] * math.cos(x[2]) * dt
+    x[1] += u[0] * math.sin(x[2]) * dt
+    x[3] = u[0]  # v 不变
+    x[4] = u[1]  # w 不变
+
+    return x
+ # motion输入当前状态，和动作指令(v,w); 返回一个状态x = [x, y, oritentation, v, w]
+ # 且运动规则假设了在dt这一段时间内，速度不发生改变
+
+def calc_dynamic_window(x, config):
+    """
+    calculation dynamic window based on current state x
+依据机器人的加减速性能限定速度采样空间在一个可行的动态范围内。
+考虑到电机可发挥的有限的加速度，整个搜索空间减少到动态窗口，该窗口仅包含下一个时间间隔内可以达到的速度。
+动态窗口是以实际速度为中心的，它的扩展取决于可以施加的加速度。
+动态窗口外的所有轨迹都不能在下一个时间间隔内达到，因此可以不考虑避障。
+    """
+
+    # Dynamic window from robot specification
+    Vs = [config.min_speed, config.max_speed,
+          -config.max_yawrate, config.max_yawrate]
+
+    # Dynamic window from motion model
+    #原始状态[~, ~, oritentation, v, w]
+    Vd = [x[3] - config.max_accel * config.dt,
+          x[3] + config.max_accel * config.dt,
+          x[4] - config.max_dyawrate * config.dt,
+          x[4] + config.max_dyawrate * config.dt]
+
+    #  [vmin,vmax, yaw_rate min, yaw_rate max]
+    # dw = Vs与Vd的交
+    dw = [max(Vs[0], Vd[0]), min(Vs[1], Vd[1]),
+          max(Vs[2], Vd[2]), min(Vs[3], Vd[3])]
+    # 函数最终返回一个动态窗口dw， 其实所有(v,w)在一个特定时刻t的搜索空间
+    return dw
+#计算出一个动态时间窗dw并返回，其实动态时间窗是(v,w)可行的一个搜索空间
+
+def predict_trajectory(x_init, v, y, config):
+    """
+    predict trajectory with an input
+    """
+
+    x = np.array(x_init)
+    traj = np.array(x)
+    time = 0
+    # 该循环实现在当前给定的动作下(v,w)， 未来一段时间内生成的轨迹
+    while time <= config.predict_time:
+        x = motion(x, [v, y], config.dt) # 每一个dt内速度不变
+        traj = np.vstack((traj, x)) #按照行方向堆叠历经的状态x
+        time += config.dt
+
+    return traj
+# 输入当前状态x以及当前动作(v,w)， 返回一个堆叠的轨迹
+
+def calc_final_input(x, dw, config, goal, ob):
+    """
+    calculation final input with dynamic window
+    输入状态、动态窗口、目标位置、障碍物位置
+    """
+
+    x_init = x[:]
+    min_cost = float("inf")
+    best_u = [0.0, 0.0]
+    best_trajectory = np.array([x])
+
+    # evaluate all trajectory with sampled input in dynamic window
+    for v in np.arange(dw[0], dw[1], config.v_reso): #对搜索空间dw中的v遍历
+        for y in np.arange(dw[2], dw[3], config.yawrate_reso): #对w遍历
+
+            trajectory = predict_trajectory(x_init, v, y, config)
+
+            # calc cost
+            to_goal_cost = config.to_goal_cost_gain * calc_to_goal_cost(trajectory, goal) # orientation与目标夹角越小越好
+            speed_cost = config.speed_cost_gain * (config.max_speed - trajectory[-1, 3]) # v越大，该项越小，则效果越好；
+            ob_cost = config.obstacle_cost_gain * calc_obstacle_cost(trajectory, ob, config) # 返回的是距离的倒数，所以该值约小，距离越大，越好
+
+            final_cost = to_goal_cost + speed_cost + ob_cost # 越小轨迹约好
+
+            # search minimum trajectory
+            if min_cost >= final_cost:  # 在所有动态窗口划出的动作空间(v,w)里，找到一个最好的动作，在这个动作下，未来预测的轨迹评价最好
+                min_cost = final_cost
+                best_u = [v, y]
+                best_trajectory = trajectory
+
+    return best_u, best_trajectory
+
+
+def calc_obstacle_cost(trajectory, ob, config):
+    """
+        calc obstacle cost inf: collision
+    """
+    ox = ob[:, 0]
+    oy = ob[:, 1]
+    dx = trajectory[:, 0] - ox[:, None]  #对历史轨迹中所有的点进行检测
+    dy = trajectory[:, 1] - oy[:, None]
+    r = np.sqrt(np.square(dx) + np.square(dy))
+
+    if config.robot_type == RobotType.rectangle:
+        yaw = trajectory[:, 2]
+        rot = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
+        rot = np.transpose(rot, [2, 0, 1])
+        local_ob = ob[:, None] - trajectory[:, 0:2]
+        local_ob = local_ob.reshape(-1, local_ob.shape[-1])
+        local_ob = np.array([local_ob @ x for x in rot])
+        local_ob = local_ob.reshape(-1, local_ob.shape[-1])
+        upper_check = local_ob[:, 0] <= config.robot_length / 2
+        right_check = local_ob[:, 1] <= config.robot_width / 2
+        bottom_check = local_ob[:, 0] >= -config.robot_length / 2
+        left_check = local_ob[:, 1] >= -config.robot_width / 2
+        if (np.logical_and(np.logical_and(upper_check, right_check),
+                           np.logical_and(bottom_check, left_check))).any():
+            return float("Inf")
+    elif config.robot_type == RobotType.circle:
+        if (r <= config.robot_radius).any(): # 如果历史轨迹中任何一点发生了碰撞，该cost记为无穷
+            return float("Inf")
+
+    min_r = np.min(r)
+    return 1.0 / min_r  # 与障碍物距离越近，该值会越大；
+
+
+def calc_to_goal_cost(trajectory, goal):
+    """
+        calc to goal cost with angle difference
+    """
+
+    dx = goal[0] - trajectory[-1, 0] #堆叠矩阵的最后一行是轨迹末尾点 x
+    dy = goal[1] - trajectory[-1, 1]  # y
+    error_angle = math.atan2(dy, dx)
+    cost_angle = error_angle - trajectory[-1, 2] # 取出 oritentation
+    cost = abs(math.atan2(math.sin(cost_angle), math.cos(cost_angle)))
+
+    return cost
+
+
+def plot_arrow(x, y, yaw, length=0.5, width=0.1):  # pragma: no cover
+    plt.arrow(x, y, length * math.cos(yaw), length * math.sin(yaw),
+              head_length=width, head_width=width)
+    plt.plot(x, y)
+
+
+def plot_robot(x, y, yaw, config):  # pragma: no cover
+    if config.robot_type == RobotType.rectangle:
+        outline = np.array([[-config.robot_length / 2, config.robot_length / 2,
+                             (config.robot_length / 2), -config.robot_length / 2,
+                             -config.robot_length / 2],
+                            [config.robot_width / 2, config.robot_width / 2,
+                             - config.robot_width / 2, -config.robot_width / 2,
+                             config.robot_width / 2]])
+        Rot1 = np.array([[math.cos(yaw), math.sin(yaw)],
+                         [-math.sin(yaw), math.cos(yaw)]])
+        outline = (outline.T.dot(Rot1)).T
+        outline[0, :] += x
+        outline[1, :] += y
+        plt.plot(np.array(outline[0, :]).flatten(),
+                 np.array(outline[1, :]).flatten(), "-k")
+    elif config.robot_type == RobotType.circle:
+        circle = plt.Circle((x, y), config.robot_radius, color="b")
+        plt.gcf().gca().add_artist(circle)
+        out_x, out_y = (np.array([x, y]) +
+                        np.array([np.cos(yaw), np.sin(yaw)]) * config.robot_radius)
+        plt.plot([x, out_x], [y, out_y], "-k")
+
+
+def main(gx=10.0, gy=10.0, robot_type=RobotType.circle):
+    print(__file__ + " start!!")
+    # initial state [x(m), y(m), yaw(rad), v(m/s), omega(rad/s)]
+    x = np.array([0.0, 0.0, math.pi / 8.0, 0.0, 0.0])#原始状态[x,y,oritentation,wx,wy]
+    # goal position [x(m), y(m)]
+    goal = np.array([gx, gy])
+    picture_num = 1
+    # obstacles [x(m) y(m), ....]
+    ob = np.array([[-1, -1],
+                   [0, 2],
+                   [4.0, 2.0],
+                   [5.0, 4.0],
+                   [5.0, 5.0],
+                   [5.0, 6.0],
+                   [5.0, 9.0],
+                   [8.0, 9.0],
+                   [7.0, 9.0],
+                   [8.0, 10.0],
+                   [9.0, 11.0],
+                   [12.0, 13.0],
+                   [12.0, 12.0],
+                   [15.0, 15.0],
+                   [13.0, 13.0]
+                   ])
+
+    # input [forward speed, yaw_rate]
+    config = Config()
+    config.robot_type = robot_type
+    trajectory = np.array(x)
+
+    while True:
+
+        u, predicted_trajectory = dwa_control(x, config, goal, ob) #输入状态、目标位置、robot的设置类、障碍物位置
+                                                                   #输出u=[v,w]、被选择的一个好的轨迹
+        x = motion(x, u, config.dt)  # 输入当前状态，和选择的一个动作，施展后更新robot的状态
+        trajectory = np.vstack((trajectory, x))  # store state history
+
+        if show_animation:
+            plt.cla()
+            plt.plot(predicted_trajectory[:, 0], predicted_trajectory[:, 1], "-g")
+            plt.plot(x[0], x[1], "xr")
+            plt.plot(goal[0], goal[1], "xb")
+            plt.plot(ob[:, 0], ob[:, 1], "ok")
+            plot_robot(x[0], x[1], x[2], config)
+            plot_arrow(x[0], x[1], x[2])
+            plt.axis("equal")
+            plt.grid(True)
+
+            plt.savefig('D:\\学习内容\\Python\\Path Planning\\png\\%d.png'%(picture_num))
+            picture_num += 1
+            plt.pause(0.0001)
+
+        # check reaching goal
+        dist_to_goal = math.sqrt((x[0] - goal[0]) ** 2 + (x[1] - goal[1]) ** 2) #与目标的距离
+        if dist_to_goal <= config.robot_radius:
+            print("Goal!!")
+            break
+
+    print("Done")
+    if show_animation: # 绘制最终的轨迹
+        plt.plot(trajectory[:, 0], trajectory[:, 1], "-r")
+        plt.pause(0.0001)
+
+    plt.show()
+
+def create_gif(gif_name, path, duration = 0.3):
+    '''
+    生成gif文件，原始图片仅支持png格式
+    gif_name ： 字符串，所生成的 gif 文件名，带 .gif 后缀
+    path :      需要合成为 gif 的图片所在路径
+    duration :  gif 图像时间间隔
+    '''
+
+    frames = []
+    pngFiles = os.listdir(path)
+    image_list = [os.path.join(path, f) for f in pngFiles]
+    for image_name in image_list:
+        # 读取 png 图像文件
+        frames.append(imageio.imread(image_name))
+    # 保存为 gif
+    imageio.mimsave(gif_name, frames, 'GIF', duration = duration)
+
+    return
+
+if __name__ == '__main__':
+    main(robot_type=RobotType.circle)
+
+    # 生成动态图
+    gif_name = 'dwa.gif'
+    path = 'D:\\学习内容\\Python\\Path Planning\\png'  # 指定文件路径
+    duration = 0.3
+    create_gif(gif_name, path, duration)
